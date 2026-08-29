@@ -9,12 +9,14 @@
 //! 1. **初始对账**：枚举 `/devices/disks`，把尚未挂载的持久块设备挂到
 //!    `/volumes/{label}`（内核 `mount_device_volume` 命名；已挂载的容忍
 //!    `AlreadyExists`——幂等，绝不双挂）。
-//! 2. **事件循环**：订阅 DEVICE 事件（DeviceArrived → 挂载；DeviceDeparted →
-//!    卸载）。**诚实边界**：本内核 ATA PIO 无运行时热插拔事件源，`arrived`
-//!    实际来自启动期设备注册的积压事件，`departed` 在当前无发布点；守护进程
-//!    逻辑完整，等真实热插拔源接入（P2-2 后续）即生效。
-//! 3. 无待消费事件时以有界休眠轮询（当前无 futex 等待原语，诚实成文，不做
-//!    忙转）。ADR-030 §决策3 的"不做轮询"目标需 futex/等待原语落地后兑现。
+//! 2. **事件循环**：阻塞等待 DEVICE 事件（interrupt-to-futex，ADR-030 §决策3
+//!    "不做轮询"）——内核 `SYS_DRIVER_EVENT_NEXT` 在事件队列空时挂起本进程，
+//!    设备注册/拔除经 `publish_event` 回调唤醒（`DeviceArrived` → 挂载；
+//!    `DeviceDeparted` → 卸载）。**诚实边界**：本内核 ATA PIO 无运行时热插拔
+//!    事件源，`arrived` 实际来自启动期设备注册的积压事件，`departed` 在当前
+//!    无发布点；守护进程逻辑完整，等真实热插拔源接入（P2-2 后续）即生效。
+//! 3. 超时（1s）醒来做**周期对账**兜底（幂等，重复挂载被内核设备登记跳过），
+//!    随后继续阻塞等待——不忙转、不轮询。
 
 #![no_std]
 #![no_main]
@@ -141,14 +143,26 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     // 1. 初始对账：挂载启动期已有的非启动块设备（内核 boot-time 已挂的跳过）。
     reconcile(&mut tracks);
 
-    // 2. 事件循环：消费 DEVICE 事件，驱动挂载/卸载。
+    // 2. 事件循环：阻塞等待 DEVICE 事件（interrupt-to-futex，ADR-030 §决策3
+    //    "不做轮询"）——内核在队列空时挂起本进程，设备注册/拔除经 publish_event
+    //    回调唤醒，取代有界休眠轮询。
+    //
+    //    WAIT_TIMEOUT_NS = 1s 是**周期对账兜底**的间隔（S17 选择理由）：
+    //    - 上界理由：热插拔事件到达是秒级以下量级（devpath 变更即回调唤醒），
+    //      1s 对"事件驱动"的响应延迟无实质影响；且 1s 远大于中断/调度 jitter，
+    //      不会因时钟精度问题反复空醒。
+    //    - 下界理由：departed 事件当前无发布源（见模块头诚实边界），周期对账是
+    //      唯一能发现"拔除但无事件"的手段；1s 保证拔除后至迟 1s 内被发现，
+    //      而不引入高频空醒（对比旧 200ms 轮询，CPU 唤醒频率降为 1/5）。
+    //    唤醒由事件回调即时触发；此超时仅是活性兜底，不构成轮询。
+    const WAIT_TIMEOUT_NS: u64 = 1_000_000_000; // 1s 周期对账兜底（理由见上）
     loop {
-        match next_device_event() {
+        match next_device_event_wait(WAIT_TIMEOUT_NS) {
             Ok(Some(ev)) => handle_event(&ev, &mut tracks),
             Ok(None) => {
-                // 无待消费事件：有界休眠后再查（当前无 futex 等待原语，见模块
-                // 注释；不做忙转）。200ms 是事件到达频率量级的保守背压。
-                let _ = sleep(200_000_000);
+                // 超时/空：周期对账（幂等，重复挂载被内核设备登记跳过），
+                // 随后继续阻塞等待——不忙转。
+                reconcile(&mut tracks);
             }
             Err(e) => {
                 logf(format_args!("event syscall error: {:?}", e));
