@@ -78,13 +78,32 @@ fn mount_and_track(dev: &str, tracks: &mut Vec<Track>) {
     }
 }
 
+/// 读取设备的易失性披露（`/devices/disks/{name}/info` 的 `volatile` 字段）。
+/// 读取失败（无 info 节点/非 JSON/缺字段）返回 `None`——调用方据此保守处理
+/// （宁可不跳过也要让它走挂载路径，由内核 volume_mount 如实判定）。
+fn device_volatile(name: &str) -> Option<bool> {
+    let path = alloc::format!("/devices/disks/{}/info", name);
+    let data = read_to_end(&path).ok()?;
+    let text = core::str::from_utf8(&data).ok()?;
+    let parsed = libsys::json::JsonParser::new(text).parse().ok()?;
+    if let libsys::json::JsonValue::Object(fields) = parsed {
+        for (k, v) in fields {
+            if k == "volatile" {
+                if let libsys::json::JsonValue::Bool(b) = v {
+                    return Some(b);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// 初始对账：枚举 /devices/disks，挂载全部尚未挂载的持久块设备。
 fn reconcile(tracks: &mut Vec<Track>) {
     let Ok(entries) = read_dir("/devices/disks") else {
         log(b"reconcile: /devices/disks unreadable (no block devices?)\n");
         return;
     };
-    log(b"reconcile: enumerating /devices/disks\n");
     for e in entries {
         // /devices/disks 只含块设备子树，每项 name 即设备名（如 "ata0"）。
         // 跳过 ., .. 这类虚项（若有）。
@@ -94,6 +113,13 @@ fn reconcile(tracks: &mut Vec<Track>) {
         let dev = e.name;
         // 已追踪的跳过（避免重复挂载）。
         if tracks.iter().any(|t| t.device == dev) {
+            continue;
+        }
+        // 易失载体（volatile=true，如内存回退盘 ramdisk0）不能挂为持久卷，
+        // 内核 volume_mount 会返回 ReadOnly——这里按设备披露**提前静默跳过**，
+        // 不发起必然失败的挂载，也不反复刷屏（对账每周期都会扫到它）。
+        // 与 handle_event 的 arrived 分支（同样过滤 volatile）口径一致。
+        if device_volatile(&dev) == Some(true) {
             continue;
         }
         mount_and_track(&dev, tracks);
