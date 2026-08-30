@@ -18,8 +18,10 @@
 //!    发布 `DeviceDeparted`；`arrived` 来自启动期设备注册与驱动注册的热插拔。
 //!    已端到端验证：QEMU 拔盘 → ATA IO 失败 → departed 事件 → 本守护卸载
 //!    挂载点（ADR-030 落地闭环）。
-//! 3. 超时（1s）醒来做**周期对账**兜底（幂等，重复挂载被内核设备登记跳过），
-//!    随后继续阻塞等待——不忙转、不轮询。
+//! 3. 超时（30s）醒来做**低频周期对账**兜底：对已挂卷做缓存穿透探测读
+//!    （`device_probe`，发现"拔除但无事件"的空闲卷）并枚举挂载新增盘。幂等，
+//!    随后继续阻塞等待——不忙转、不高频轮询（旧 1s 对账曾每 1s 抢占 CPU，
+//!    表现为交互卡顿，已降为 30s）。
 
 #![no_std]
 #![no_main]
@@ -101,8 +103,35 @@ fn device_volatile(name: &str) -> Option<bool> {
     None
 }
 
-/// 初始对账：枚举 /devices/disks，挂载全部尚未挂载的持久块设备。
+/// 周期对账：1) 对已挂载设备做缓存穿透探测，发现"拔除但无事件"的空闲卷并
+/// 卸载；2) 枚举 /devices/disks，挂载新增持久盘。
+///
+/// 探测（probe）绕过 VFS 页缓存、直接触达 ATA 驱动真实读；设备已消失时驱动
+/// 发布 DeviceDeparted（ADR-030 闭环），本函数主动卸载以消除事件队列延迟——
+/// 事件到达时 handle_event 因 track 已移除而幂等跳过。RAM 回退盘等 volatile
+/// 载体读恒成功（Alive），不误伤。本函数由**低频**定时器驱动（`WAIT_TIMEOUT_NS`，
+/// 默认 30s），不构成高频轮询。
 fn reconcile(tracks: &mut Vec<Track>) {
+    // 1. 探测已挂设备存活：设备消失（Gone）→ 立即卸载并移除追踪。
+    let mut to_unmount: Vec<Track> = Vec::new();
+    let mut i = 0;
+    while i < tracks.len() {
+        match device_probe(&tracks[i].device) {
+            Ok(ProbeStatus::Gone) => {
+                to_unmount.push(tracks.remove(i));
+                // 不 i++：remove 已把后继前移，继续检查同下标。
+            }
+            _ => i += 1,
+        }
+    }
+    for t in to_unmount {
+        match volume_unmount(&t.path) {
+            Ok(()) => logf(format_args!("unmounted {} ({}) via probe", t.device, t.path)),
+            Err(e) => logf(format_args!("unmount {} ({}) via probe failed: {:?}", t.device, t.path, e)),
+        }
+    }
+
+    // 2. 枚举 /devices/disks，挂载新增持久块设备（幂等，已挂的跳过）。
     let Ok(entries) = read_dir("/devices/disks") else {
         log(b"reconcile: /devices/disks unreadable (no block devices?)\n");
         return;
@@ -176,15 +205,15 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     //    "不做轮询"）——内核在队列空时挂起本进程，设备注册/拔除经 publish_event
     //    回调唤醒，取代有界休眠轮询。
     //
-    //    WAIT_TIMEOUT_NS = 1s 是**周期对账兜底**的间隔（S17 选择理由）：
-    //    - 上界理由：热插拔事件到达是秒级以下量级（devpath 变更即回调唤醒），
-    //      1s 对"事件驱动"的响应延迟无实质影响；且 1s 远大于中断/调度 jitter，
-    //      不会因时钟精度问题反复空醒。
-    //    - 下界理由：departed 事件当前无发布源（见模块头诚实边界），周期对账是
-    //      唯一能发现"拔除但无事件"的手段；1s 保证拔除后至迟 1s 内被发现，
-    //      而不引入高频空醒（对比旧 200ms 轮询，CPU 唤醒频率降为 1/5）。
+    //    WAIT_TIMEOUT_NS = 30s 是**低频周期对账兜底**的间隔：
+    //    - 上界理由：热插拔事件（arrived/departed）由 publish_event 即时唤醒，
+    //      30s 对事件驱动的响应延迟无实质影响——已挂卷的拔除由对账探测
+    //      （device_probe，见 reconcile）兜底发现，最坏延迟 30s；
+    //    - 下界理由：若对账过频（如旧 1s），每 1s 唤醒做探测/枚举会与用户交互
+    //      抢占 CPU，表现为"敲命令卡顿"（本会话已量化）。30s 把唤醒频率降为
+    //      1/30，日常无感，同时保留拔除兜底能力。
     //    唤醒由事件回调即时触发；此超时仅是活性兜底，不构成轮询。
-    const WAIT_TIMEOUT_NS: u64 = 1_000_000_000; // 1s 周期对账兜底（理由见上）
+    const WAIT_TIMEOUT_NS: u64 = 30_000_000_000; // 30s 低频对账兜底（理由见上）
     loop {
         match next_device_event_wait(WAIT_TIMEOUT_NS) {
             Ok(Some(ev)) => handle_event(&ev, &mut tracks),
