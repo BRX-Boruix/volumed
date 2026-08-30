@@ -211,20 +211,23 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     //    "不做轮询"）——内核在队列空时挂起本进程，设备注册/拔除经 publish_event
     //    回调唤醒，取代有界休眠轮询。
     //
-    //    WAIT_TIMEOUT_NS = 1s 是周期对账兜底的间隔：
+    //    WAIT_TIMEOUT_NS = 5s 是周期对账兜底的间隔（ADR-031 落地后回调自 1s）：
     //    - 卡顿根源已由 probe_alive 消除：旧实现对账里 device_probe 走
     //      read_at 的 ATA PIO 忙等（每次 200_000 次 inb 轮询，QEMU 下每个
     //      inb 都是 VM-exit），1s 对账即"每秒卡一下"。改为 probe_alive（仅
-    //      3 次 status 读）后对账微秒级，1s 唤醒不再抢 CPU 卡顿（本会话验证：
-    //      1s 对账下 pwd/ls/echo 全部即时回显，无卡顿无丢字符）。
-    //    - 上界理由（不可用 > 数秒）：volumed 阻塞在 block_for_event 的
-    //      idle-halt 时，CPU 停在等待者循环；由于内核调度基于用户态中断帧、
-    //      不支持在内核态 idle-halt 切换进程（scheduler.rs block_for_event
-    //      None 分支），此时 shell 就绪也不会被调度。故**键盘输入延迟 = 对账
-    //      间隔**：30s 时字符积压 30-40s 再 flush，用户不可接受（本会话已量化
-    //      A/B 验证）。1s 把最坏延迟压到 ~1s，键盘即时。
+    //      3 次 status 读）后对账微秒级，不抢 CPU 卡顿（ADR-030 最终方案）。
+    //    - 间隔上界理由（ADR-031 修正）：旧论证"键盘输入延迟 = 对账间隔，
+    //      30s 时字符积压 30-40s"建立在 `block_for_event` 的 idle-halt **只等
+    //      自己**、就绪的 shell 不被调度之上。ADR-031 的 frame-based
+    //      `schedule_from_block`（kernel `eb97b23`）已让 idle-halt 分支在就绪
+    //      队列出现任一进程时主动 frame 切走，**键盘输入不再依赖对账间隔**，
+    //      该约束失效（已端到端验证：30s 间隔下键盘逐字符即时、零积压）。
+    //      故上界改由"拔除/新增设备的兜底发现延迟"决定：事件路径（真实 IO
+    //      失败即时 departed、publish_event 即时唤醒）保证热插拔即时性，周期
+    //      对账仅兜底"拔除但无事件"的空闲卷；5s 使兜底发现延迟 ≤5s，兼顾热插拔
+    //      体验与对账频率（较 1s 少 5 倍 syscall 开销）。
     //    唤醒由事件回调即时触发；此超时仅是活性兜底 + 拔除兜底探测，不构成轮询。
-    const WAIT_TIMEOUT_NS: u64 = 1_000_000_000; // 1s：probe_alive 轻量化后对账不卡顿；更长的间隔会让 volumed 长时间停在 idle-halt，键盘输入延迟≈间隔（详见 ADR-030）。
+    const WAIT_TIMEOUT_NS: u64 = 5_000_000_000; // 5s：probe_alive 微秒级对账不卡顿；上界由设备变化兜底发现延迟决定（ADR-031 已消除键盘延迟约束，详见 ADR-030/031）。
     loop {
         match next_device_event_wait(WAIT_TIMEOUT_NS) {
             Ok(Some(ev)) => handle_event(&ev, &mut tracks),
