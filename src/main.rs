@@ -18,10 +18,16 @@
 //!    发布 `DeviceDeparted`；`arrived` 来自启动期设备注册与驱动注册的热插拔。
 //!    已端到端验证：QEMU 拔盘 → ATA IO 失败 → departed 事件 → 本守护卸载
 //!    挂载点（ADR-030 落地闭环）。
-//! 3. 超时（30s）醒来做**低频周期对账**兜底：对已挂卷做缓存穿透探测读
-//!    （`device_probe`，发现"拔除但无事件"的空闲卷）并枚举挂载新增盘。幂等，
-//!    随后继续阻塞等待——不忙转、不高频轮询（旧 1s 对账曾每 1s 抢占 CPU，
-//!    表现为交互卡顿，已降为 30s）。
+//! 3. 超时（1s）醒来做**周期对账**兜底：对已挂卷做**轻量存活探测**
+//!    （`device_probe` → 内核 `IoDevice::probe_alive`，只读几次状态、不触发完整
+//!    ATA PIO 相位，发现"拔除但无事件"的空闲卷）并枚举挂载新增盘。幂等，随后
+//!    继续阻塞等待——不忙转、不高频轮询。间隔取 1s 而非更长：旧实现对账探测走
+//!    `read_at` 的 ATA PIO 忙等（每次最多 20 万次 `inb`），1s 对账即"每秒卡一下"；
+//!    改 `probe_alive`（微秒级）后卡顿消除，1s 唤醒不再抢占 CPU。而若间隔拉到
+//!    数秒级（如 30s），volumed 长时间阻塞在 `block_for_event` 的 idle-halt——内核
+//!    调度基于用户态中断帧、不支持在内核态 idle-halt 切换进程，此时 shell 就绪也
+//!    不被调度，**键盘输入延迟≈对账间隔**（30s 实测字符积压 30-40s）。1s 把最坏
+//!    延迟压到 ~1s，键盘即时。
 
 #![no_std]
 #![no_main]
@@ -110,7 +116,7 @@ fn device_volatile(name: &str) -> Option<bool> {
 /// 发布 DeviceDeparted（ADR-030 闭环），本函数主动卸载以消除事件队列延迟——
 /// 事件到达时 handle_event 因 track 已移除而幂等跳过。RAM 回退盘等 volatile
 /// 载体读恒成功（Alive），不误伤。本函数由**低频**定时器驱动（`WAIT_TIMEOUT_NS`，
-/// 默认 30s），不构成高频轮询。
+/// 默认 1s），不构成高频轮询。
 fn reconcile(tracks: &mut Vec<Track>) {
     // 1. 探测已挂设备存活：设备消失（Gone）→ 立即卸载并移除追踪。
     let mut to_unmount: Vec<Track> = Vec::new();
@@ -205,15 +211,20 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     //    "不做轮询"）——内核在队列空时挂起本进程，设备注册/拔除经 publish_event
     //    回调唤醒，取代有界休眠轮询。
     //
-    //    WAIT_TIMEOUT_NS = 30s 是**低频周期对账兜底**的间隔：
-    //    - 上界理由：热插拔事件（arrived/departed）由 publish_event 即时唤醒，
-    //      30s 对事件驱动的响应延迟无实质影响——已挂卷的拔除由对账探测
-    //      （device_probe，见 reconcile）兜底发现，最坏延迟 30s；
-    //    - 下界理由：若对账过频（如旧 1s），每 1s 唤醒做探测/枚举会与用户交互
-    //      抢占 CPU，表现为"敲命令卡顿"（本会话已量化）。30s 把唤醒频率降为
-    //      1/30，日常无感，同时保留拔除兜底能力。
-    //    唤醒由事件回调即时触发；此超时仅是活性兜底，不构成轮询。
-    const WAIT_TIMEOUT_NS: u64 = 30_000_000_000; // 30s 低频对账兜底（理由见上）
+    //    WAIT_TIMEOUT_NS = 1s 是周期对账兜底的间隔：
+    //    - 卡顿根源已由 probe_alive 消除：旧实现对账里 device_probe 走
+    //      read_at 的 ATA PIO 忙等（每次 200_000 次 inb 轮询，QEMU 下每个
+    //      inb 都是 VM-exit），1s 对账即"每秒卡一下"。改为 probe_alive（仅
+    //      3 次 status 读）后对账微秒级，1s 唤醒不再抢 CPU 卡顿（本会话验证：
+    //      1s 对账下 pwd/ls/echo 全部即时回显，无卡顿无丢字符）。
+    //    - 上界理由（不可用 > 数秒）：volumed 阻塞在 block_for_event 的
+    //      idle-halt 时，CPU 停在等待者循环；由于内核调度基于用户态中断帧、
+    //      不支持在内核态 idle-halt 切换进程（scheduler.rs block_for_event
+    //      None 分支），此时 shell 就绪也不会被调度。故**键盘输入延迟 = 对账
+    //      间隔**：30s 时字符积压 30-40s 再 flush，用户不可接受（本会话已量化
+    //      A/B 验证）。1s 把最坏延迟压到 ~1s，键盘即时。
+    //    唤醒由事件回调即时触发；此超时仅是活性兜底 + 拔除兜底探测，不构成轮询。
+    const WAIT_TIMEOUT_NS: u64 = 1_000_000_000; // 1s：probe_alive 轻量化后对账不卡顿；更长的间隔会让 volumed 长时间停在 idle-halt，键盘输入延迟≈间隔（详见 ADR-030）。
     loop {
         match next_device_event_wait(WAIT_TIMEOUT_NS) {
             Ok(Some(ev)) => handle_event(&ev, &mut tracks),
