@@ -1,0 +1,6 @@
+docs: update head comment - real hotplug departed source now exists
+
+ATA PIO kernel driver now publishes DeviceDeparted on device-disappearance
+(is_device_gone on IO failure). Remove the stale 'no runtime hotplug source /
+departed has no publish point' honesty boundary; note E2E verification of
+unplug -> ATA IO fail -> departed event -> unmount (ADR-030 closed-loop).

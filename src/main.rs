@@ -12,9 +12,12 @@
 //! 2. **事件循环**：阻塞等待 DEVICE 事件（interrupt-to-futex，ADR-030 §决策3
 //!    "不做轮询"）——内核 `SYS_DRIVER_EVENT_NEXT` 在事件队列空时挂起本进程，
 //!    设备注册/拔除经 `publish_event` 回调唤醒（`DeviceArrived` → 挂载；
-//!    `DeviceDeparted` → 卸载）。**诚实边界**：本内核 ATA PIO 无运行时热插拔
-//!    事件源，`arrived` 实际来自启动期设备注册的积压事件，`departed` 在当前
-//!    无发布点；守护进程逻辑完整，等真实热插拔源接入（P2-2 后续）即生效。
+//!    `DeviceDeparted` → 卸载）。**热插拔发布点**：内核 ATA PIO 驱动在块读失败
+//!    且判定设备消失（`is_device_gone`：状态重复 0xFF / ERR|DF，覆盖 QEMU
+//!    `drive_del` 与真实物理拔盘）时，经 `DriverHub::unregister_device_by_name`
+//!    发布 `DeviceDeparted`；`arrived` 来自启动期设备注册与驱动注册的热插拔。
+//!    已端到端验证：QEMU 拔盘 → ATA IO 失败 → departed 事件 → 本守护卸载
+//!    挂载点（ADR-030 落地闭环）。
 //! 3. 超时（1s）醒来做**周期对账**兜底（幂等，重复挂载被内核设备登记跳过），
 //!    随后继续阻塞等待——不忙转、不轮询。
 
